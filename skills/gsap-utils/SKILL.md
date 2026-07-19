@@ -1,23 +1,10 @@
 ---
 name: gsap-utils
-description: |
-  Official GSAP skill for gsap.utils — clamp, mapRange, normalize, interpolate, random, snap, toArray, wrap, pipe. Use when the user asks about gsap.utils, clamp, mapRange, random, snap, toArray, wrap, or helper utilities in GSAP.
-triggers:
-  - "gsap utils"
-  - "clamp animation value"
-  - "maprange"
-  - "snap animation"
-  - "gsap random"
+description: Official GSAP skill for gsap.utils — clamp, mapRange, normalize, interpolate, random, snap, toArray, wrap, pipe. Use when the user asks about gsap.utils, clamp, mapRange, random, snap, toArray, wrap, or helper utilities in GSAP.
 license: MIT
-od:
-  mode: prototype
-  category: animation-motion
-  upstream: "https://github.com/greensock/gsap-skills"
 ---
 
 # gsap.utils
-
-> Curated from GreenSock's official GSAP skills: https://github.com/greensock/gsap-skills
 
 ## When to Use This Skill
 
