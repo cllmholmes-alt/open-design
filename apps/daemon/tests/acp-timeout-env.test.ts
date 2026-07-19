@@ -126,3 +126,15 @@ test('detectAcpModels treats OD_ACP_TIMEOUT_MS=0 as disabling the ACP probe time
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test.runIf(process.platform === 'win32')('detectAcpModels launches Windows npm .cmd shims', async () => {
+  const { dir, bin } = writeDelayedSuccessProbe(0);
+  const cmd = join(dir, 'acp-probe.cmd');
+  writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${bin}" %*\r\n`, 'utf8');
+  try {
+    const models = await detectAcpModels({ bin: cmd, args: [] });
+    assert.deepEqual(models, [{ id: 'default', label: 'Default (CLI config)' }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
