@@ -176,11 +176,25 @@ export const codexAgentDef = {
           args.push('--add-dir', d);
         }
       }
-      if (options.model && options.model !== 'default') {
-        args.push('--model', options.model);
+      const requestedModel = options.model;
+      const codexProMode =
+        requestedModel === 'gpt-5.6-sol-pro' ||
+        requestedModel === 'gpt-5.6-terra-pro' ||
+        requestedModel === 'gpt-5.6-luna-pro';
+      const wireModel = codexProMode
+        ? requestedModel.slice(0, -'-pro'.length)
+        : requestedModel;
+      if (wireModel && wireModel !== 'default') {
+        args.push('--model', wireModel);
       }
-      if (options.reasoning && options.reasoning !== 'default') {
-        const effort = clampCodexReasoning(options.model, options.reasoning);
+      const requestedReasoning =
+        requestedModel === 'gpt-5.6-luna-pro'
+          ? 'max'
+          : codexProMode
+            ? 'ultra'
+            : options.reasoning;
+      if (requestedReasoning && requestedReasoning !== 'default') {
+        const effort = clampCodexReasoning(wireModel, requestedReasoning);
         // Codex accepts `-c key=value` config overrides; reasoning effort
         // is exposed as `model_reasoning_effort`.
         args.push('-c', `model_reasoning_effort="${effort}"`);

@@ -128,3 +128,25 @@ contract preview. Do not make it the main deliverable.
   original subject or prompt".
 - If the user asks for immediate UI generation too, finish these contract files
   first, then hand off to the appropriate artifact skill in the next step.
+
+## Production import and promotion handoff
+
+When a design system must remain editable in Open Design and later update more
+than one production stack, the implementation handoff must also define:
+
+1. A manifest with stable screen/canvas IDs, token sources, interaction sources,
+   responsive requirements, and every package file.
+2. Content-addressed quarantine. Never execute generated HTML/JavaScript or copy
+   it directly into a native application.
+3. A screen-by-screen production map. Several canvases may share one source
+   document, but each stable ID still requires a real implementation target.
+4. Platform ownership: web exports map into web components/styles/assets;
+   iOS design intent maps into React Native/native Swift/assets/Xcode rather than
+   a WebView shortcut.
+5. Source-hash freshness, active-content review, local test/build evidence, and
+   rollback metadata before promotion.
+6. A separate, non-self-approving release step for production deploys, signing,
+   TestFlight, App Store, or other provider mutations.
+
+See `references/native-web-production-promotion.md` for a concrete governed
+implementation pattern and failure modes.

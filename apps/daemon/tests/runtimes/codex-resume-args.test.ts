@@ -59,6 +59,36 @@ describe('codex buildArgs session resume', () => {
     expect(modelIndex).toBeLessThan(idIndex);
   });
 
+  it('maps GPT-5.6 pro mode to the base Codex model with ultra reasoning', () => {
+    const args = codexAgentDef.buildArgs(
+      'prompt',
+      [],
+      [],
+      { model: 'gpt-5.6-sol-pro', reasoning: 'low' },
+      {},
+    );
+    const modelIndex = args.indexOf('--model');
+    expect(args[modelIndex + 1]).toBe('gpt-5.6-sol');
+    expect(args).not.toContain('gpt-5.6-sol-pro');
+    expect(args).toContain('model_reasoning_effort="ultra"');
+    expect(args).not.toContain('model_reasoning_effort="low"');
+  });
+
+  it('maps Luna pro mode to max because Luna does not support ultra reasoning', () => {
+    const args = codexAgentDef.buildArgs(
+      'prompt',
+      [],
+      [],
+      { model: 'gpt-5.6-luna-pro', reasoning: 'low' },
+      {},
+    );
+    const modelIndex = args.indexOf('--model');
+    expect(args[modelIndex + 1]).toBe('gpt-5.6-luna');
+    expect(args).not.toContain('gpt-5.6-luna-pro');
+    expect(args).toContain('model_reasoning_effort="max"');
+    expect(args).not.toContain('model_reasoning_effort="ultra"');
+  });
+
   it('excludes the create-only `-C` and `--add-dir` flags on resume (rejected by `exec resume`)', () => {
     const args = codexAgentDef.buildArgs(
       'prompt',
