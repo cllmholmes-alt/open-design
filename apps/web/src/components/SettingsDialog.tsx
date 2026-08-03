@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, Dispatch, SetStateAction } from 'react';
 import { Button, VisuallyHidden } from '@open-design/components';
-import type { AmrWalletSnapshot } from '@open-design/contracts';
+import type {
+  AmrWalletSnapshot,
+  ByokCredentialProfile,
+  UpsertByokCredentialProfileRequest,
+} from '@open-design/contracts';
 import { validateBaseUrl } from '@open-design/contracts/api/connectionTest';
 import {
   agentIdToTracking,
@@ -10,6 +14,7 @@ import {
   settingsSectionToTracking,
 } from '@open-design/contracts/analytics';
 import { useAnalytics } from '../analytics/provider';
+import { byokErrorCode } from '../analytics/byok-error-code';
 import {
   amrHandoffDeviceId,
   attributedAmrUrl,
@@ -69,8 +74,10 @@ import {
 } from './modelOptions';
 import {
   BYOK_PROVIDER_PRESETS,
+  classifyByokCredentialProfileFailure,
   DEFAULT_NOTIFICATIONS,
   DEFAULT_ORBIT,
+  applySavedByokCredentialProfile,
   defaultKnownProviderModel,
   isStoredMediaProviderEntryEmpty,
   isStoredMediaProviderEntryPresent,
@@ -123,7 +130,11 @@ import type {
   ProviderModelsResponse,
   SkillSummary,
 } from '../types';
-import { testAgent, testApiProvider } from '../providers/connection-test';
+import {
+  testAgent,
+  testApiProvider,
+  testSavedByokProfile,
+} from '../providers/connection-test';
 import { fetchProviderModels } from '../providers/provider-models';
 import {
   fetchConnectors,
@@ -139,6 +150,7 @@ import type { MediaProvider } from '../media/models';
 import { Toast } from './Toast';
 import {
   checkForUpdaterUpdate,
+  clearUpdaterCache,
   deriveUpdaterModel,
   downloadUpdaterUpdate,
   openUpdaterInstaller,
@@ -419,6 +431,14 @@ interface Props {
    * "Save key" button rather than the autosave channel.
    */
   onPersistComposioKey: (composio: AppConfig['composio']) => Promise<void> | void;
+  /**
+   * Explicitly moves the current BYOK key draft into the daemon's OS-backed
+   * credential store. The returned profile is non-secret and becomes the only
+   * credential reference retained by the UI.
+   */
+  onPersistByokCredential?: (
+    input: UpsertByokCredentialProfileRequest,
+  ) => Promise<ByokCredentialProfile>;
   /**
    * True while the daemon-backed Composio config is still hydrating on
    * first paint after a dev-server / app restart. The Connectors section
@@ -1217,7 +1237,8 @@ function sameAgentModelChoice(
   right: AgentModelChoice | undefined,
 ): boolean {
   return (left?.model ?? null) === (right?.model ?? null)
-    && (left?.reasoning ?? null) === (right?.reasoning ?? null);
+    && (left?.reasoning ?? null) === (right?.reasoning ?? null)
+    && (left?.serviceTier ?? null) === (right?.serviceTier ?? null);
 }
 
 export function reconcileAmrProfileEnv(
@@ -1350,7 +1371,11 @@ export function shouldEnableSettingsSave(
       cfg.agentId && agents.find((a) => a.id === cfg.agentId)?.available,
     );
   }
-  return Boolean(cfg.apiKey.trim() && cfg.model.trim() && isBaseUrlValid);
+  return Boolean(
+    (cfg.apiKey.trim() || (cfg.byokProfileId && cfg.byokCredentialConfigured))
+    && cfg.model.trim()
+    && isBaseUrlValid,
+  );
 }
 
 /**
@@ -1385,6 +1410,9 @@ export function sanitizeSettingsSavePayload(
     ...cfg,
     mode: initial.mode,
     apiKey: initial.apiKey,
+    byokProfileId: initial.byokProfileId,
+    byokCredentialConfigured: initial.byokCredentialConfigured,
+    byokCredentialTail: initial.byokCredentialTail,
     apiProtocol: initial.apiProtocol,
     apiVersion: initial.apiVersion,
     apiProtocolConfigs: initial.apiProtocolConfigs,
@@ -1415,7 +1443,7 @@ export function switchApiProtocolConfig(
     },
     protocol,
   );
-  return applyApiProtocolConfig(
+  const switched = applyApiProtocolConfig(
     {
       ...config,
       mode: 'api',
@@ -1424,6 +1452,14 @@ export function switchApiProtocolConfig(
     protocol,
     nextApiConfig,
   );
+  return currentProtocol === protocol
+    ? switched
+    : {
+        ...switched,
+        byokProfileId: undefined,
+        byokCredentialConfigured: false,
+        byokCredentialTail: undefined,
+      };
 }
 
 export function SettingsDialog({
@@ -1438,6 +1474,7 @@ export function SettingsDialog({
   onPersist,
   onSilentUpdatePreferenceChange,
   onPersistComposioKey,
+  onPersistByokCredential,
   composioConfigLoading = false,
   onClose,
   onRefreshAgents,
@@ -1772,6 +1809,7 @@ export function SettingsDialog({
   const providerTestRevisionRef = useRef(0);
   const providerModelsRevisionRef = useRef(0);
   const providerTestFirstResetRef = useRef(true);
+  const providerTestSkipNextResetRef = useRef(false);
   const providerModelsFirstResetRef = useRef(true);
   const providerModelsSkipNextResetRef = useRef(false);
   const deferAfterKeyCleanRef = useRef(false);
@@ -1796,6 +1834,9 @@ export function SettingsDialog({
   const [aboutUpdateActionBusy, setAboutUpdateActionBusy] = useState(false);
   const [aboutUpdateQuitFailed, setAboutUpdateQuitFailed] = useState(false);
   const [aboutToast, setAboutToast] = useState<string | null>(null);
+  // Two-stage inline confirm for the destructive manual cache clear.
+  const [clearUpdaterCacheStage, setClearUpdaterCacheStage] = useState<'idle' | 'confirm'>('idle');
+  const [clearUpdaterCacheBusy, setClearUpdaterCacheBusy] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -1905,6 +1946,28 @@ export function SettingsDialog({
     void openExternalUrl(OPEN_DESIGN_RELEASES_URL);
   }, []);
 
+  // Manual updater/launcher cache clear — the disaster-recovery action for
+  // stuck update state. The desktop owns the capability; this handler only
+  // reports the outcome and refreshes the About updater model.
+  const handleClearUpdaterCache = useCallback(() => {
+    if (clearUpdaterCacheBusy) return;
+    setClearUpdaterCacheBusy(true);
+    void (async () => {
+      try {
+        const result = await clearUpdaterCache();
+        if (result.ok) {
+          setAboutUpdaterModel(result.model);
+          setAboutToast(t('settings.clearUpdaterCacheSuccess'));
+        } else {
+          setAboutToast(t('settings.clearUpdaterCacheFailed'));
+        }
+      } finally {
+        setClearUpdaterCacheBusy(false);
+        setClearUpdaterCacheStage('idle');
+      }
+    })();
+  }, [clearUpdaterCacheBusy, t]);
+
   // Precise inverse of App.handleCompleteOnboarding: flip
   // onboardingCompleted back to false, mirror it to localStorage and the
   // daemon through the same config-persist path, then route the user into
@@ -2012,6 +2075,10 @@ export function SettingsDialog({
       providerTestFirstResetRef.current = false;
       return;
     }
+    if (providerTestSkipNextResetRef.current) {
+      providerTestSkipNextResetRef.current = false;
+      return;
+    }
     providerTestRevisionRef.current += 1;
     providerAutoTestKeyRef.current = null;
     setByokPreconditionNotice(null);
@@ -2112,6 +2179,14 @@ export function SettingsDialog({
         ? (current.apiProviderBaseUrl ?? null) !== null
         : currentProtocol !== provider.protocol ||
           (current.apiProviderBaseUrl ?? null) !== nextProviderBaseUrl;
+      const finalizeProviderSwitch = (next: AppConfig): AppConfig => providerChanged
+        ? {
+            ...next,
+            byokProfileId: undefined,
+            byokCredentialConfigured: false,
+            byokCredentialTail: undefined,
+          }
+        : next;
       const switched = switchApiProtocolConfig(current, provider.protocol);
       const fallbackApiConfig = currentApiProtocolConfig(switched);
       const customDraftKey = provider.custom
@@ -2142,7 +2217,7 @@ export function SettingsDialog({
       };
       if (savedDraft) {
         applyDraftUiState(savedDraft);
-        return applyApiProtocolConfig(
+        return finalizeProviderSwitch(applyApiProtocolConfig(
           persistByokProviderConfigDraft(
             {
               ...switched,
@@ -2153,11 +2228,11 @@ export function SettingsDialog({
           ),
           provider.protocol,
           savedDraft.apiConfig,
-        );
+        ));
       }
       if (persistedDraft) {
         applyDraftUiState(undefined);
-        return applyApiProtocolConfig(
+        return finalizeProviderSwitch(applyApiProtocolConfig(
           persistByokProviderConfigDraft(
             {
               ...switched,
@@ -2168,7 +2243,7 @@ export function SettingsDialog({
           ),
           provider.protocol,
           persistedDraft.apiConfig,
-        );
+        ));
       }
       const switchedWithCurrentDraft = persistByokProviderConfigDraft(
         switched,
@@ -2177,22 +2252,42 @@ export function SettingsDialog({
       );
       if (provider.custom) {
         applyDraftUiState(undefined);
-        return updateCurrentApiProtocolConfig(switchedWithCurrentDraft, {
+        return finalizeProviderSwitch(updateCurrentApiProtocolConfig(switchedWithCurrentDraft, {
           apiProviderBaseUrl: null,
           ...(providerChanged ? { model: '' } : {}),
-        });
+        }));
       }
       applyDraftUiState(undefined);
-      return updateCurrentApiProtocolConfig(switchedWithCurrentDraft, {
+      return finalizeProviderSwitch(updateCurrentApiProtocolConfig(switchedWithCurrentDraft, {
         ...(providerChanged ? { apiKey: '' } : {}),
         baseUrl: provider.baseUrl,
         model: provider.preferredModels[0] ?? '',
         apiProviderBaseUrl: provider.baseUrl,
-      });
+      }));
     });
   };
   const updateApiConfig = (patch: Partial<ApiProtocolConfig>) =>
-    setCfg((c) => updateCurrentApiProtocolConfig(c, patch));
+    setCfg((c) => {
+      const next = updateCurrentApiProtocolConfig(c, patch);
+      const invalidatesProfile = (
+        (patch.apiKey !== undefined && Boolean(patch.apiKey.trim()))
+        || (patch.baseUrl !== undefined && patch.baseUrl !== c.baseUrl)
+        || (patch.model !== undefined && patch.model !== c.model)
+        || (patch.apiVersion !== undefined && patch.apiVersion !== c.apiVersion)
+      );
+      return invalidatesProfile
+        ? {
+            ...next,
+            // Keep the id so a confirmed replacement updates the existing
+            // secure-store entry instead of leaking orphaned keychain items.
+            // The configured marker is cleared so runs remain blocked until
+            // the edited draft is tested and saved again.
+            byokProfileId: c.byokProfileId,
+            byokCredentialConfigured: false,
+            byokCredentialTail: undefined,
+          }
+        : next;
+    });
   const updateMaxTokensInput = (raw: string) => {
     setMaxTokensInput(raw);
     const trimmed = raw.trim();
@@ -2378,6 +2473,7 @@ export function SettingsDialog({
           agentId: selected.id,
           model: choice.model || undefined,
           reasoning: choice.reasoning || undefined,
+          serviceTier: choice.serviceTier || undefined,
           agentCliEnv: cfg.agentCliEnv ?? {},
         },
         controller.signal,
@@ -2485,23 +2581,56 @@ export function SettingsDialog({
       }
     };
     try {
-      const result = await testApiProvider(
-        {
-          protocol: apiProtocol,
-          baseUrl: cfg.baseUrl,
-          apiKey: cleanByokApiKey(cfg.apiKey),
-          model: cfg.model,
-          apiVersion:
-            apiProtocol === 'azure'
-              ? cfg.apiVersion?.trim() || undefined
-              : undefined,
-        },
-        controller.signal,
+      const testingSavedProfile = Boolean(
+        cfg.byokProfileId
+        && cfg.byokCredentialConfigured
+        && !cfg.apiKey.trim(),
       );
+      const result = testingSavedProfile && cfg.byokProfileId
+        ? await testSavedByokProfile(cfg.byokProfileId, controller.signal)
+        : await testApiProvider(
+            {
+              protocol: apiProtocol,
+              baseUrl: cfg.baseUrl,
+              apiKey: cleanByokApiKey(cfg.apiKey),
+              model: cfg.model,
+              apiVersion:
+                apiProtocol === 'azure'
+                  ? cfg.apiVersion?.trim() || undefined
+                  : undefined,
+            },
+            controller.signal,
+          );
       if (controller.signal.aborted) return;
       if (providerTestRevisionRef.current !== revision) {
         clearIfStale();
         return;
+      }
+      if (result.ok && apiProtocol !== 'bedrock' && !testingSavedProfile) {
+        if (!onPersistByokCredential) {
+          throw new Error('Secure BYOK credential storage is unavailable');
+        }
+        const profile = await onPersistByokCredential({
+          ...(cfg.byokProfileId ? { id: cfg.byokProfileId } : {}),
+          label: selectedProvider?.label ?? API_PROTOCOL_LABELS[apiProtocol],
+          protocol: apiProtocol,
+          baseUrl: cfg.baseUrl.trim(),
+          model: cfg.model.trim(),
+          ...(apiProtocol === 'azure' && cfg.apiVersion?.trim()
+            ? { apiVersion: cfg.apiVersion.trim() }
+            : {}),
+          requiresApiKey: byokRequiresApiKey,
+          ...(cfg.apiKey.trim()
+            ? { apiKey: cleanByokApiKey(cfg.apiKey) }
+            : {}),
+        });
+        if (controller.signal.aborted) return;
+        if (providerTestRevisionRef.current !== revision) {
+          clearIfStale();
+          return;
+        }
+        providerTestSkipNextResetRef.current = true;
+        setCfg((current) => applySavedByokCredentialProfile(current, profile));
       }
       setProviderTestState({ status: 'done', result });
       if (!result.ok && result.kind === 'not_found_model') {
@@ -2514,7 +2643,7 @@ export function SettingsDialog({
           area: 'execution_model',
           provider_id: byokProviderId,
           result: byokTrackingTestResult(result),
-          ...(result.ok ? {} : { error_code: result.kind || 'UNKNOWN' }),
+          ...(result.ok ? {} : { error_code: byokErrorCode(result) }),
           ...(result.ok ? {} : { error_kind: result.kind || 'UNKNOWN' }),
           field_missing: 'none',
           config_key_changed: configKeyChanged,
@@ -2541,13 +2670,14 @@ export function SettingsDialog({
       });
       const byokProviderId = byokProtocolToTracking(apiProtocol);
       if (byokProviderId) {
+        const failure = classifyByokCredentialProfileFailure(err);
         trackSettingsByokTestResult(analytics.track, {
           page_name: 'settings',
           area: 'execution_model',
           provider_id: byokProviderId,
           result: 'failed',
-          error_code: err instanceof Error ? err.name : 'UNKNOWN',
-          error_kind: err instanceof Error ? err.name : 'UNKNOWN',
+          error_code: failure.errorCode,
+          error_kind: failure.errorKind,
           field_missing: 'none',
           config_key_changed: configKeyChanged,
           success_after_action: false,
@@ -3241,11 +3371,15 @@ export function SettingsDialog({
     [apiProtocol],
   );
   const selectedProviderIndex =
-    cfg.apiProviderBaseUrl == null
-      ? -1
-      : protocolProviders.findIndex(
-          (p) => p.baseUrl === cfg.apiProviderBaseUrl && p.baseUrl === cfg.baseUrl,
-        );
+    protocolProviders.findIndex((p) => {
+      if (cfg.apiProviderBaseUrl == null) {
+        return apiProtocol === 'azure' && p.baseUrl === '' && Boolean(cfg.baseUrl?.trim());
+      }
+      return (
+        p.baseUrl === cfg.apiProviderBaseUrl &&
+        (p.baseUrl === cfg.baseUrl || (apiProtocol === 'azure' && p.baseUrl === ''))
+      );
+    });
   const selectedProvider = selectedProviderIndex >= 0 ? protocolProviders[selectedProviderIndex] : undefined;
   const apiKeyConsoleLink =
     selectedProvider?.apiKeyConsoleLink ?? defaultApiKeyConsoleLink;
@@ -3260,6 +3394,13 @@ export function SettingsDialog({
     cfg.baseUrl,
   );
   const byokProviderConfigured = (provider: ByokProviderPreset): boolean => {
+    if (
+      selectedByokProvider?.id === provider.id
+      && cfg.byokProfileId
+      && cfg.byokCredentialConfigured
+    ) {
+      return true;
+    }
     if (provider.custom) {
       return canRunProviderConnectionTest(currentApiProtocolConfig(cfg), {
         requiresApiKey: byokRequiresApiKey,
@@ -3276,7 +3417,12 @@ export function SettingsDialog({
           ? undefined
           : cfg.apiProtocolConfigs?.[provider.protocol]
       );
-    if (!entry || entry.baseUrl !== provider.baseUrl) return false;
+    if (!entry) return false;
+    if (provider.baseUrl) {
+      if (entry.baseUrl !== provider.baseUrl) return false;
+    } else if (provider.protocol !== 'azure' && entry.baseUrl !== provider.baseUrl) {
+      return false;
+    }
     const knownProvider = KNOWN_PROVIDERS.find((item) => item.baseUrl === provider.baseUrl);
     return canRunProviderConnectionTest(entry, {
       requiresApiKey: byokProviderRequiresApiKey(
@@ -3305,6 +3451,9 @@ export function SettingsDialog({
       },
       {
         requiresApiKey: byokRequiresApiKey,
+        credentialConfigured: Boolean(
+          cfg.byokProfileId && cfg.byokCredentialConfigured,
+        ),
         keyValidationBaseUrl: byokKeyValidationBaseUrl,
       },
     ),
@@ -3314,6 +3463,8 @@ export function SettingsDialog({
       byokRequiresApiKey,
       cfg.apiKey,
       cfg.baseUrl,
+      cfg.byokCredentialConfigured,
+      cfg.byokProfileId,
       cfg.model,
     ],
   );
@@ -3328,6 +3479,8 @@ export function SettingsDialog({
       cfg.apiProtocol,
       cfg.apiProviderBaseUrl,
       cfg.baseUrl,
+      cfg.byokCredentialConfigured,
+      cfg.byokProfileId,
       cfg.model,
     ],
   );
@@ -3344,6 +3497,9 @@ export function SettingsDialog({
       },
       {
         requiresApiKey: byokRequiresApiKey,
+        credentialConfigured: Boolean(
+          cfg.byokProfileId && cfg.byokCredentialConfigured,
+        ),
         requireModel: false,
         keyValidationBaseUrl: byokKeyValidationBaseUrl,
       },
@@ -3354,6 +3510,8 @@ export function SettingsDialog({
       byokRequiresApiKey,
       cfg.apiKey,
       cfg.baseUrl,
+      cfg.byokCredentialConfigured,
+      cfg.byokProfileId,
       cfg.model,
     ],
   );
@@ -3645,7 +3803,8 @@ export function SettingsDialog({
     focusByokRequiredFieldAfterProtocolSwitchRef.current = false;
     focusByokRequiredField(
       missingByokConnectionFields(cfg, {
-        requiresApiKey: byokRequiresApiKey,
+        requiresApiKey: byokRequiresApiKey
+          && !(cfg.byokProfileId && cfg.byokCredentialConfigured),
       })[0],
     );
   }, [apiModelCustomActive, cfg, apiProtocol, byokRequiresApiKey]);
@@ -3790,15 +3949,22 @@ export function SettingsDialog({
         ? choice.model
         : null;
     const setChoice = (
-      next: { model?: string; reasoning?: string },
+      next: { model?: string; reasoning?: string; serviceTier?: string },
     ) => {
       setCfg((c) => {
         const prev = c.agentModels?.[selected.id] ?? {};
+        const merged = { ...prev, ...next };
+        if (
+          Object.prototype.hasOwnProperty.call(next, 'serviceTier') &&
+          next.serviceTier === undefined
+        ) {
+          delete merged.serviceTier;
+        }
         return {
           ...c,
           agentModels: {
             ...(c.agentModels ?? {}),
-            [selected.id]: { ...prev, ...next },
+            [selected.id]: merged,
           },
         };
       });
@@ -3814,6 +3980,14 @@ export function SettingsDialog({
       effectiveChoice.reasoning ??
       choice.reasoning ??
       selected.reasoningOptions?.[0]?.id ?? '';
+    const currentModelOption =
+      selected.models?.find((m) => m.id === modelValue) ?? null;
+    const serviceTierOptions = currentModelOption?.serviceTierOptions ?? [];
+    const hasServiceTiers = serviceTierOptions.length > 0;
+    const serviceTierValue =
+      serviceTierOptions.some((tier) => tier.id === choice.serviceTier)
+        ? choice.serviceTier!
+        : 'default';
     const customActive =
       allowCustomModel &&
       hasModels &&
@@ -3868,7 +4042,7 @@ export function SettingsDialog({
                         next.add(selected.id);
                         return next;
                       });
-                      setChoice({ model: '' });
+                      setChoice({ model: '', serviceTier: undefined });
                     } else {
                       setAgentCustomModelIds((prev) => {
                         if (!prev.has(selected.id)) return prev;
@@ -3876,7 +4050,17 @@ export function SettingsDialog({
                         next.delete(selected.id);
                         return next;
                       });
-                      setChoice({ model: nextValue });
+                      const nextModelOption = selected.models?.find((m) => m.id === nextValue);
+                      const nextServiceTierOptions =
+                        nextModelOption?.serviceTierOptions ?? [];
+                      setChoice({
+                        model: nextValue,
+                        serviceTier: nextServiceTierOptions.some(
+                          (tier) => tier.id === choice.serviceTier,
+                        )
+                          ? choice.serviceTier
+                          : undefined,
+                      });
                     }
                   }}
                   additionalOptions={
@@ -3926,7 +4110,7 @@ export function SettingsDialog({
               value={modelValue}
               placeholder={t('settings.modelCustomPlaceholder')}
               onChange={(e) =>
-                setChoice({ model: e.target.value.trim() })
+                setChoice({ model: e.target.value.trim(), serviceTier: undefined })
               }
             />
           </label>
@@ -3946,6 +4130,36 @@ export function SettingsDialog({
                 {selected.reasoningOptions!.map((r) => (
                   <option key={r.id} value={r.id}>
                     {r.label}
+                  </option>
+                ))}
+              </select>
+              <Icon
+                name="chevron-down"
+                size={12}
+                className="agent-model-select-chevron"
+              />
+            </div>
+          </label>
+        ) : null}
+        {hasServiceTiers ? (
+          <label className="field">
+            <span className="field-label">
+              {t('settings.serviceTierPicker')}
+            </span>
+            <div className="agent-model-select-wrap">
+              <select
+                value={serviceTierValue}
+                onChange={(e) =>
+                  setChoice({
+                    serviceTier:
+                      e.target.value === 'default' ? undefined : e.target.value,
+                  })
+                }
+              >
+                <option value="default">{t('common.default')}</option>
+                {serviceTierOptions.map((tier) => (
+                  <option key={tier.id} value={tier.id}>
+                    {tier.label}
                   </option>
                 ))}
               </select>
@@ -5287,7 +5501,12 @@ export function SettingsDialog({
                     azureHint: t('settings.azureBaseUrlHint'),
                   }}
                   onBlur={commitProviderModelsInputs}
-                  onChange={(value) => updateApiConfig({ baseUrl: value, apiProviderBaseUrl: null })}
+                  onChange={(value) =>
+                    updateApiConfig({
+                      baseUrl: value,
+                      apiProviderBaseUrl: apiProtocol === 'azure' ? '' : null,
+                    })
+                  }
                   onCustomize={() => {
                     updateApiConfig({ apiProviderBaseUrl: null });
                     window.setTimeout(() => baseUrlInputRef.current?.focus(), 0);
@@ -5329,7 +5548,7 @@ export function SettingsDialog({
                     ? t('settings.azureCustomDeploymentName')
                     : t('settings.modelCustomLabel'),
                   customModelPlaceholder: apiProtocol === 'azure'
-                    ? 'e.g. gpt-4o-production'
+                    ? t('settings.azureDeploymentModel')
                     : t('settings.modelCustomPlaceholder'),
                   fetchModelsUnsupported: t('settings.fetchModelsUnsupported'),
                   model: apiProtocol === 'azure'
@@ -5366,6 +5585,7 @@ export function SettingsDialog({
                     : null
                 }
                 providerModelsFailureMessage={providerModelsFailureMessage}
+                forceTextInput={apiProtocol === 'azure'}
                 showAzureModelFetchHint={apiProtocol === 'azure'}
                 showFetchModelsUnsupportedHint={
                   apiProtocol !== 'azure' &&
@@ -5845,6 +6065,41 @@ export function SettingsDialog({
                   </span>
                 </label>
               </div>
+              {aboutUpdaterModel.environment === 'desktop'
+                && aboutUpdaterModel.supported
+                && appVersionInfo?.packaged !== false ? (
+                <div className="settings-about-diagnostics">
+                  <div className="settings-about-diagnostics-text">
+                    <h4>{t('settings.clearUpdaterCacheTitle')}</h4>
+                    <p className="hint">{t('settings.clearUpdaterCacheHint')}</p>
+                  </div>
+                  {clearUpdaterCacheStage === 'confirm' ? (
+                    <>
+                      <Button
+                        disabled={clearUpdaterCacheBusy}
+                        onClick={() => setClearUpdaterCacheStage('idle')}
+                      >
+                        {t('common.cancel')}
+                      </Button>
+                      <Button
+                        data-testid="settings-clear-updater-cache-confirm"
+                        disabled={clearUpdaterCacheBusy || aboutUpdaterModel.busy}
+                        onClick={handleClearUpdaterCache}
+                      >
+                        {t('settings.clearUpdaterCacheConfirmButton')}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      data-testid="settings-clear-updater-cache"
+                      disabled={clearUpdaterCacheBusy || aboutUpdaterModel.busy}
+                      onClick={() => setClearUpdaterCacheStage('confirm')}
+                    >
+                      {t('settings.clearUpdaterCacheButton')}
+                    </Button>
+                  )}
+                </div>
+              ) : null}
               <div className="settings-about-diagnostics">
                 <div className="settings-about-diagnostics-text">
                   <h4>{t('diagnostics.exportTitle')}</h4>

@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OpenDesignHostUpdaterStatusSnapshot } from '@open-design/host';
 import { installMockOpenDesignHost } from '@open-design/host/testing';
+import type { UpsertByokCredentialProfileRequest } from '@open-design/contracts';
 import { en } from '../../src/i18n/locales/en';
 
 function optionNames(container: HTMLElement): string[] {
@@ -111,6 +112,7 @@ import { reconcileAmrProfileEnv } from '../../src/components/SettingsDialog';
 import { providerModelsCacheKey } from '../../src/components/providerModelsCache';
 import { I18nProvider } from '../../src/i18n';
 import { LOCALES } from '../../src/i18n/types';
+import { ByokCredentialProfileHttpError } from '../../src/state/config';
 import { MAX_MAX_TOKENS, MIN_MAX_TOKENS } from '../../src/state/maxTokens';
 import type {
   AgentInfo,
@@ -157,6 +159,8 @@ const amrAgent: AgentInfo = {
   models: [{ id: 'default', label: 'Default' }],
   supportsCustomModel: false,
 };
+
+const inFlightAuthAttemptId = '936da01f-9abd-4d9d-80c7-02af85c822a8';
 
 type OnRefreshAgents = (
   options?: AgentRefreshOptions,
@@ -282,6 +286,19 @@ function renderSettingsDialog(
 ) {
   const onPersist = vi.fn();
   const onPersistComposioKey = vi.fn();
+  const onPersistByokCredential = vi.fn(async (input: UpsertByokCredentialProfileRequest) => ({
+    id: input.id ?? 'byok-test-profile',
+    label: input.label,
+    protocol: input.protocol,
+    baseUrl: input.baseUrl,
+    model: input.model,
+    apiVersion: input.apiVersion,
+    requiresApiKey: input.requiresApiKey ?? true,
+    configured: true,
+    keyTail: input.apiKey?.slice(-4),
+    createdAt: 1,
+    updatedAt: 1,
+  }));
   const onSilentUpdatePreferenceChange: (allowSilentUpdates: boolean) => Promise<void> =
     options.onSilentUpdatePreferenceChange
     ?? (async () => undefined);
@@ -300,6 +317,7 @@ function renderSettingsDialog(
       onPersist={onPersist}
       onSilentUpdatePreferenceChange={onSilentUpdatePreferenceChange}
       onPersistComposioKey={onPersistComposioKey}
+      onPersistByokCredential={onPersistByokCredential}
       onClose={onClose}
       onRefreshAgents={onRefreshAgents}
     />,
@@ -309,6 +327,7 @@ function renderSettingsDialog(
     onPersist,
     onSilentUpdatePreferenceChange,
     onPersistComposioKey,
+    onPersistByokCredential,
     onClose,
     onRefreshAgents,
     ...view,
@@ -1214,10 +1233,8 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
     fireEvent.change(screen.getByLabelText('API key'), {
       target: { value: 'azure-key' },
     });
+    expect(screen.queryByLabelText('Custom deployment name')).toBeNull();
     fireEvent.change(screen.getByLabelText('Deployment name'), {
-      target: { value: '__custom__' },
-    });
-    fireEvent.change(screen.getByLabelText('Custom deployment name'), {
       target: { value: 'deployment-one' },
     });
     fireEvent.change(screen.getByLabelText('Base URL'), {
@@ -1240,10 +1257,26 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
         model: 'deployment-one',
         baseUrl: 'https://example.openai.azure.com',
         apiVersion: '2024-10-21',
-        apiProviderBaseUrl: null,
+        apiProviderBaseUrl: '',
       }),
       {},
     );
+
+    const persistedConfig = onPersist.mock.calls.at(-1)?.[0] as AppConfig;
+    cleanup();
+
+    renderSettingsDialog(persistedConfig);
+
+    expect((screen.getByLabelText('Deployment name') as HTMLInputElement).value).toBe(
+      'deployment-one',
+    );
+    expect((screen.getByLabelText('Base URL') as HTMLInputElement).value).toBe(
+      'https://example.openai.azure.com',
+    );
+    expect((screen.getByLabelText('API version') as HTMLInputElement).value).toBe(
+      '2024-10-21',
+    );
+    expect(screen.queryByLabelText('Custom deployment name')).toBeNull();
   });
 
   it('does not fetch provider models while the API key edit is still uncommitted', async () => {
@@ -1327,7 +1360,7 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
     expect(screen.getByText('Model discovery is not available for this protocol.')).toBeTruthy();
 
     fetchProviderModelsMock.mockClear();
-    fireEvent.click(screen.getByRole('tab', { name: '小米 MiMo' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Xiaomi MiMo' }));
     await new Promise((resolve) => window.setTimeout(resolve, 350));
 
     expect(fetchProviderModelsMock).not.toHaveBeenCalled();
@@ -1640,7 +1673,7 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
   });
 
   it('auto-tests a saved complete BYOK config when Settings opens', async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = input.toString();
       if (url === '/api/memory') {
         return new Response(
@@ -1773,7 +1806,7 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
       apiProviderBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
     });
 
-    fireEvent.click(screen.getByRole('tab', { name: '智谱' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Zhipu AI' }));
 
     expect(await screen.findByText('✓ Loaded 8 models from your account.')).toBeTruthy();
     fireEvent.click(screen.getByRole('combobox', { name: 'Model' }));
@@ -2362,6 +2395,60 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
     );
   });
 
+  it('reports secure profile persistence failures with stable BYOK telemetry', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/memory') {
+        return new Response(
+          JSON.stringify({ enabled: true, memories: [], extraction: null }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      expect(url).toBe('/api/test/connection');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          kind: 'ok',
+          latencyMs: 20,
+          model: 'claude-sonnet-4-5',
+          sample: 'pong',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { onPersistByokCredential } = renderSettingsDialog({
+      apiKey: 'sk-ant-test-provider',
+    });
+    onPersistByokCredential.mockRejectedValueOnce(
+      new ByokCredentialProfileHttpError(
+        400,
+        'Invalid secure profile',
+        'VALIDATION_FAILED',
+      ),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test' }));
+
+    await waitFor(() => {
+      expect(analyticsTrackMock).toHaveBeenCalledWith(
+        'settings_byok_test_result',
+        expect.objectContaining({
+          page_name: 'settings',
+          area: 'execution_model',
+          provider_id: 'anthropic',
+          result: 'failed',
+          error_code: 'VALIDATION_FAILED',
+          error_kind: 'unknown',
+          field_missing: 'none',
+          success_after_action: false,
+        }),
+        undefined,
+      );
+    });
+  });
+
   it('renders invalid Base URL test failures on the Base URL field', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = input.toString();
@@ -2705,6 +2792,129 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     expect(
       screen.getByText(/Showing built-in defaults/i),
     ).toBeTruthy();
+  });
+
+  it('persists Codex service tier selection and sends it to the agent test', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/test/connection') {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            kind: 'success',
+            latencyMs: 12,
+            model: 'gpt-5.5',
+            sample: 'ok',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { onPersist } = renderSettingsDialog(
+      {
+        mode: 'daemon',
+        agentId: 'codex',
+        agentModels: {
+          codex: { model: 'gpt-5.5', reasoning: 'default' },
+        },
+      },
+      {
+        agents: [
+          {
+            ...availableAgents[0]!,
+            reasoningOptions: [
+              { id: 'default', label: 'Default' },
+              { id: 'high', label: 'High' },
+            ],
+            modelsSource: 'live',
+            models: [
+              { id: 'default', label: 'Default' },
+              {
+                id: 'gpt-5.5',
+                label: 'gpt-5.5',
+                serviceTierOptions: [{ id: 'priority', label: 'Fast' }],
+              },
+            ],
+          },
+        ],
+      },
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /Local CLI/i }));
+    const serviceTierPicker = screen.getByRole('combobox', {
+      name: en['settings.serviceTierPicker'],
+    }) as HTMLSelectElement;
+    expect(
+      Array.from(serviceTierPicker.options).map((option) => option.textContent),
+    ).toEqual(['Default', 'Fast']);
+
+    fireEvent.change(serviceTierPicker, { target: { value: 'priority' } });
+
+    await waitForPersist(
+      onPersist,
+      expect.objectContaining({
+        agentModels: {
+          codex: {
+            model: 'gpt-5.5',
+            reasoning: 'default',
+            serviceTier: 'priority',
+          },
+        },
+      }),
+      {},
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: en['settings.test'] }));
+
+    await waitFor(() => {
+      const calls = fetchMock.mock.calls as Array<[RequestInfo | URL, RequestInit?]>;
+      const testCall = calls.find(
+        ([input]) => input.toString() === '/api/test/connection',
+      );
+      expect(testCall).toBeDefined();
+      const init = testCall?.[1] as RequestInit | undefined;
+      const body = JSON.parse(String(init?.body));
+      expect(body).toEqual(expect.objectContaining({
+        mode: 'agent',
+        agentId: 'codex',
+        model: 'gpt-5.5',
+        reasoning: 'default',
+        serviceTier: 'priority',
+      }));
+    });
+
+    const reasoningPicker = screen.getByRole('combobox', {
+      name: en['settings.reasoningPicker'],
+    }) as HTMLSelectElement;
+    fireEvent.change(reasoningPicker, { target: { value: 'high' } });
+
+    await waitForPersist(
+      onPersist,
+      expect.objectContaining({
+        agentModels: {
+          codex: {
+            model: 'gpt-5.5',
+            reasoning: 'high',
+            serviceTier: 'priority',
+          },
+        },
+      }),
+      {},
+    );
+
+    fireEvent.change(serviceTierPicker, { target: { value: 'default' } });
+
+    await waitFor(() => {
+      const clearedPersist = onPersist.mock.calls.find(([config]) => {
+        const choice = (config as AppConfig).agentModels?.codex;
+        return choice?.model === 'gpt-5.5'
+          && choice.reasoning === 'high'
+          && !Object.prototype.hasOwnProperty.call(choice, 'serviceTier');
+      });
+      expect(clearedPersist).toBeDefined();
+    });
   });
 
   it('uses the existing Settings card picker for AMR without exposing custom stale models', () => {
@@ -3135,6 +3345,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
               ? {
                   loggedIn: false,
                   loginInFlight: true,
+                  authAttemptId: inFlightAuthAttemptId,
                   profile: 'local',
                   user: null,
                   configPath: '/Users/test/.amr/config.json',
@@ -3142,6 +3353,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
               : {
                   loggedIn: false,
                   loginInFlight: false,
+                  authAttemptId: inFlightAuthAttemptId,
                   profile: 'local',
                   user: null,
                   configPath: '/Users/test/.amr/config.json',
@@ -3151,6 +3363,9 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
         );
       }
       if (url === '/api/integrations/vela/login/cancel' && init?.method === 'POST') {
+        expect(JSON.parse(String(init.body))).toEqual({
+          authAttemptId: inFlightAuthAttemptId,
+        });
         statusStage = 'signed-out';
         return new Response(JSON.stringify({ canceled: true }), {
           status: 200,
@@ -3174,7 +3389,13 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
 
     expect(await screen.findByText('Canceled')).toBeTruthy();
-    expect(fetchMock).toHaveBeenCalledWith('/api/integrations/vela/login/cancel', { method: 'POST' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/integrations/vela/login/cancel',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ authAttemptId: inFlightAuthAttemptId }),
+      }),
+    );
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Authorize' })).toBeTruthy();
@@ -3208,6 +3429,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
           JSON.stringify({
             loggedIn: false,
             loginInFlight: true,
+            authAttemptId: inFlightAuthAttemptId,
             profile: 'local',
             user: null,
             configPath: '/Users/test/.amr/config.json',
@@ -3216,6 +3438,9 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
         );
       }
       if (url === '/api/integrations/vela/login/cancel' && init?.method === 'POST') {
+        expect(JSON.parse(String(init.body))).toEqual({
+          authAttemptId: inFlightAuthAttemptId,
+        });
         cancelReceived = true;
         return new Response(JSON.stringify({ canceled: true }), {
           status: 200,
@@ -3272,31 +3497,37 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
             ? {
                 loggedIn: false,
                 loginInFlight: true,
+                authAttemptId: inFlightAuthAttemptId,
                 profile: 'local',
                 user: null,
                 configPath: '/Users/test/.amr/config.json',
               }
             : statusStage === 'signed-in'
               ? {
-                  loggedIn: true,
-                  loginInFlight: false,
-                  profile: 'local',
-                  user: { id: 'user-1', email: 'late@example.com' },
-                  configPath: '/Users/test/.amr/config.json',
-                }
+                loggedIn: true,
+                loginInFlight: false,
+                authAttemptId: inFlightAuthAttemptId,
+                profile: 'local',
+                user: { id: 'user-1', email: 'late@example.com' },
+                configPath: '/Users/test/.amr/config.json',
+              }
               : {
-                  loggedIn: false,
-                  loginInFlight: false,
-                  profile: 'local',
-                  user: null,
-                  configPath: '/Users/test/.amr/config.json',
-                };
+                loggedIn: false,
+                loginInFlight: false,
+                authAttemptId: inFlightAuthAttemptId,
+                profile: 'local',
+                user: null,
+                configPath: '/Users/test/.amr/config.json',
+              };
         return new Response(JSON.stringify(body), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
       }
       if (url === '/api/integrations/vela/login/cancel' && init?.method === 'POST') {
+        expect(JSON.parse(String(init.body))).toEqual({
+          authAttemptId: inFlightAuthAttemptId,
+        });
         statusStage = 'signed-out';
         return new Response(JSON.stringify({ canceled: true }), {
           status: 200,
@@ -5228,6 +5459,76 @@ describe('SettingsDialog about interactions', () => {
       expect(download).toHaveBeenCalledWith({ payload: { source: 'settings-about' } });
     });
     expect(screen.getByText('Version 1.2.3-beta.4 is ready to install.')).toBeTruthy();
+  });
+
+  it('clears the updater cache from the about page after inline confirmation', async () => {
+    const cleared = updateStatus({ state: 'idle' });
+    const clearCache = vi.fn(async () => cleared);
+    restoreOpenDesignHost = installMockOpenDesignHost({
+      host: {
+        updater: {
+          'clear-cache': clearCache,
+          status: vi.fn(async () => updateStatus()),
+        },
+      },
+    });
+
+    renderSettingsDialog(
+      { mode: 'daemon', agentId: 'codex' },
+      {
+        initialSection: 'about',
+        appVersionInfo: {
+          version: '1.2.3-beta.3',
+          channel: 'beta',
+          packaged: true,
+          platform: 'darwin',
+          arch: 'arm64',
+        },
+      },
+    );
+
+    // Two-stage inline confirm: the first click only arms the action.
+    const trigger = await screen.findByTestId('settings-clear-updater-cache');
+    fireEvent.click(trigger);
+    expect(clearCache).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId('settings-clear-updater-cache-confirm'));
+
+    await waitFor(() => {
+      expect(clearCache).toHaveBeenCalled();
+    });
+    expect(await screen.findByText(en['settings.clearUpdaterCacheSuccess'])).toBeTruthy();
+  });
+
+  it('hides updater cache recovery when packaged updates are unsupported', async () => {
+    restoreOpenDesignHost = installMockOpenDesignHost({
+      host: {
+        updater: {
+          status: vi.fn(async () => updateStatus({
+            platform: 'linux',
+            state: 'unsupported',
+            supported: false,
+          })),
+        },
+      },
+    });
+
+    renderSettingsDialog(
+      { mode: 'daemon', agentId: 'codex' },
+      {
+        initialSection: 'about',
+        appVersionInfo: {
+          version: '1.2.3-beta.3',
+          channel: 'beta',
+          packaged: true,
+          platform: 'linux',
+          arch: 'x64',
+        },
+      },
+    );
+
+    await screen.findByText(en['settings.updateStatusUnsupported']);
+    expect(screen.queryByTestId('settings-clear-updater-cache')).toBeNull();
   });
 
   it('installs a downloaded payload update from the about page', async () => {

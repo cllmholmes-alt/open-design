@@ -63,6 +63,7 @@ import {
   exportDiagnosticsToFile,
   registerDesktopDiagnosticsIpc,
 } from "./diagnostics.js";
+import { notifyDesktopExternalShow } from "./external-show.js";
 
 // Re-export pure URL-policy helpers so the packaged workspace's
 // vitest can pin their behaviour without spinning up a full Electron
@@ -141,6 +142,7 @@ export function applyOsLocaleSwitch(electronApp: Electron.App): string {
 
 export type DesktopMainOptions = {
   beforeShutdown?: () => Promise<void>;
+  onExternalShow?: () => void | Promise<void>;
   discoverWebUrl?: () => Promise<string | null>;
   /**
    * Round-7 (lefarcen P2 @ runtime.ts:336): packaged builds report the
@@ -866,6 +868,7 @@ export async function runDesktopMain(
             return activeDesktop.console();
           case SIDECAR_MESSAGES.SHOW:
             activeDesktop.show();
+            notifyDesktopExternalShow(options.onExternalShow);
             return { accepted: true };
           case SIDECAR_MESSAGES.CLICK:
             return await activeDesktop.click(request.input as DesktopClickInput);
@@ -940,7 +943,11 @@ export async function runDesktopMain(
     desktop.openUpdateDialog({ source: "mac-app-menu" });
   }
   console.info("[open-design desktop] desktop runtime created");
-  options.onDesktopReady?.({ show: () => desktop?.show() });
+  options.onDesktopReady?.({
+    show: () => {
+      void Promise.resolve(options.onExternalShow?.()).finally(() => desktop?.show());
+    },
+  });
 
   const discoverDaemonBaseUrl = resolveDaemonBaseUrl(runtime, options);
   // Report each abnormal exit of a prior run now that the daemon is up to relay
