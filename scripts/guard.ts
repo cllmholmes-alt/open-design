@@ -98,6 +98,11 @@ const residualAllowedExactPaths = new Set([
   // compiled). It must ship as a browser-loadable `.js` asset, same as the
   // web notifications service worker above.
   "apps/landing-page/public/community/_site-nav.js",
+  // Generated browser bundles copied from the pinned cobe and matter-js
+  // dependencies during the landing-page build. They are gitignored vendor
+  // outputs, not project-owned JavaScript source.
+  "apps/landing-page/public/enhancers/cobe.js",
+  "apps/landing-page/public/enhancers/matter.min.js",
   // PostCSS loads Tailwind through a web-local .mjs compatibility config entry.
   "apps/web/postcss.config.mjs",
   "scripts/bake-html-ppt-examples.mjs",
